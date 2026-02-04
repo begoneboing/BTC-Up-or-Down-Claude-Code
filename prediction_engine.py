@@ -99,7 +99,7 @@ class PredictionEngine:
 
     # Valid price range for Polymarket (0-1 probabilities)
     MIN_VALID_PRICE = 0.0
-    MAX_VALID_PRICE = 1.0
+    MAX_VALID_PRICE = 1000000.0  # Support BTC and other asset prices
     MIN_DATA_POINTS = 20  # Minimum data points required for analysis
 
     def __init__(self):
@@ -144,7 +144,7 @@ class PredictionEngine:
 
             # Check valid price range (with small tolerance for float precision)
             if price_float < self.MIN_VALID_PRICE - 0.001 or price_float > self.MAX_VALID_PRICE + 0.001:
-                return False, f"Price {price_float} at index {i} outside valid range [0, 1]"
+                return False, f"Price {price_float} at index {i} outside valid range [{self.MIN_VALID_PRICE}, {self.MAX_VALID_PRICE}]"
 
         return True, ""
 

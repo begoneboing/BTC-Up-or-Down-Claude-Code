@@ -186,52 +186,41 @@ class BTC15MBot:
         """
         Fetch the current active BTC 15-minute Up/Down market from Polymarket
 
-        Uses the Gamma API events endpoint to find markets with slug pattern 'btc-updown-15m-*'
+        Uses timestamp-based slug lookup: btc-updown-15m-{timestamp}
         """
         now = datetime.now(timezone.utc)
         print(f"Looking for BTC 15-minute Up/Down markets... (current UTC: {now.strftime('%H:%M')})")
 
         try:
-            # Search Gamma API events for btc-updown-15m markets
-            response = requests.get(
-                f"{GAMMA_URL}/events",
-                params={"active": "true", "closed": "false", "limit": 100},
-                timeout=60
-            )
-            if response.status_code != 200:
-                print(f"Gamma API error: {response.status_code}")
-                return None
+            # Calculate current 15-minute slot timestamp
+            minute = (now.minute // 15) * 15
+            slot_time = now.replace(minute=minute, second=0, microsecond=0)
+            current_ts = int(slot_time.timestamp())
 
-            events = response.json()
+            # Try current and next few slots to find an open market
+            for offset in range(0, 4):
+                ts = current_ts + (offset * 15 * 60)
+                slug = f"btc-updown-15m-{ts}"
 
-            # Find BTC 15-minute Up/Down events by slug pattern
-            btc_15m_events = []
-            for event in events:
-                slug = event.get('slug', '')
-                if slug.startswith('btc-updown-15m-'):
-                    # Check if event is still active
-                    if event.get('active') and not event.get('closed'):
-                        btc_15m_events.append(event)
+                response = requests.get(
+                    f"{GAMMA_URL}/events/slug/{slug}",
+                    timeout=30
+                )
 
-            if not btc_15m_events:
-                print("No BTC 15-minute events found via events API")
-                return None
+                if response.status_code != 200:
+                    continue
 
-            print(f"Found {len(btc_15m_events)} BTC 15-minute events")
+                event = response.json()
 
-            # Sort by liquidity (higher = more active)
-            btc_15m_events.sort(key=lambda x: float(x.get('liquidity', 0) or 0), reverse=True)
-
-            # Find a market that's accepting orders
-            for event in btc_15m_events:
-                title = event.get('title', '')
-                slug = event.get('slug', '')
+                # Check if closed
+                if event.get('closed', True):
+                    continue
 
                 markets = event.get('markets', [])
                 if not markets:
                     continue
 
-                market = markets[0]  # Usually just one market per event
+                market = markets[0]
 
                 # Check if accepting orders
                 if not market.get('acceptingOrders', False):
@@ -246,7 +235,8 @@ class BTC15MBot:
                 if prices_set == {'0', '1'} or prices_set == {'1', '0'}:
                     continue  # Already resolved
 
-                print(f"Selected market: {title}")
+                title = event.get('title', '')
+                print(f"Found market: {title}")
                 print(f"  Slug: {slug}")
                 print(f"  Liquidity: ${float(event.get('liquidity', 0) or 0):,.0f}")
 
@@ -285,7 +275,7 @@ class BTC15MBot:
                         liquidity=float(event.get('liquidity', 0) or 0)
                     )
 
-            print("No active BTC 15-minute markets accepting orders")
+            print("No active BTC 15-minute markets found")
 
         except Exception as e:
             print(f"Error fetching market: {e}")
@@ -850,6 +840,99 @@ class BTC15MBot:
                 print(f"\nTrade {trades_placed} completed: {trade['direction']} ${trade['total']:.2f}")
 
         self.print_summary()
+
+    def check_position_profit(self, token_id: str, entry_price: float, size: float) -> Dict:
+        """
+        Check current profit/loss on a position
+
+        Returns:
+            Dict with current_price, pnl, pnl_pct, should_exit
+        """
+        try:
+            current_prices = self.executor.get_market_price(token_id)
+            current_price = current_prices.get('mid_price', entry_price)
+
+            pnl = (current_price - entry_price) * size
+            pnl_pct = (current_price - entry_price) / entry_price * 100 if entry_price > 0 else 0
+
+            return {
+                'current_price': current_price,
+                'entry_price': entry_price,
+                'size': size,
+                'pnl': pnl,
+                'pnl_pct': pnl_pct,
+                'should_exit': pnl_pct >= 15  # Exit at 15% profit
+            }
+        except Exception as e:
+            print(f"Error checking position: {e}")
+            return {'current_price': entry_price, 'pnl': 0, 'pnl_pct': 0, 'should_exit': False}
+
+    def exit_position(self, token_id: str, size: float, current_price: float, reason: str = "profit_target") -> bool:
+        """
+        Exit a position by selling
+
+        Args:
+            token_id: Token to sell
+            size: Number of shares to sell
+            current_price: Current market price
+            reason: Reason for exit
+
+        Returns:
+            True if exit successful
+        """
+        try:
+            print(f"\n[EXIT] Selling {size} shares at {current_price:.1%} ({reason})")
+
+            order = self.executor.place_order(
+                token_id=token_id,
+                side=OrderSide.SELL,
+                price=max(current_price - 0.02, 0.01),  # Sell slightly below market
+                size=size,
+                market_question=f"EXIT: {reason}"
+            )
+
+            if order:
+                print(f"Exit order {order.status.value}: {order.order_id[:30]}...")
+                return True
+            return False
+        except Exception as e:
+            print(f"Exit error: {e}")
+            return False
+
+    def monitor_and_exit_positions(self, positions: List[Dict], profit_threshold: float = 0.15):
+        """
+        Monitor open positions and exit when profitable
+
+        Args:
+            positions: List of position dicts with token_id, entry_price, size, direction
+            profit_threshold: Exit when profit exceeds this (default 15%)
+        """
+        print(f"\n{'='*60}")
+        print("MONITORING POSITIONS FOR PROFIT EXIT")
+        print(f"Profit threshold: {profit_threshold:.0%}")
+        print(f"{'='*60}")
+
+        for pos in positions:
+            token_id = pos.get('token_id')
+            entry_price = pos.get('entry_price')
+            size = pos.get('size')
+            direction = pos.get('direction', 'unknown')
+
+            if not token_id or not entry_price:
+                continue
+
+            profit_info = self.check_position_profit(token_id, entry_price, size)
+
+            print(f"\n{direction}: Entry={entry_price:.1%}, Current={profit_info['current_price']:.1%}, PnL={profit_info['pnl_pct']:+.1f}%")
+
+            if profit_info['pnl_pct'] >= profit_threshold * 100:
+                print(f"  -> Profit target hit! Exiting...")
+                self.exit_position(token_id, size, profit_info['current_price'], "profit_target")
+            elif profit_info['pnl_pct'] <= -20:  # Stop loss at -20%
+                print(f"  -> Stop loss triggered! Exiting...")
+                self.exit_position(token_id, size, profit_info['current_price'], "stop_loss")
+            else:
+                print(f"  -> Holding position")
 
     def print_summary(self):
         """Print trading session summary"""
